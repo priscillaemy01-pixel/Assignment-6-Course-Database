@@ -1,52 +1,54 @@
-const http = require('http');
+const express = require('express');
 const path = require('path');
 const sqlite3 = require('sqlite3').verbose();
 
+const app = express();
 const port = Number(process.env.PORT) || 3000;
 const databasePath = path.join(__dirname, 'database', 'university.db');
+let db;
+let server;
 
-function sendJson(response, statusCode, data, headers = {}) {
-  response.writeHead(statusCode, {
-    'Content-Type': 'application/json; charset=utf-8',
-    ...headers,
-  });
-  response.end(JSON.stringify(data));
+app.use(express.json({ limit: '1mb' }));
+
+function asyncRoute(handler) {
+  return (request, response, next) => {
+    Promise.resolve(handler(request, response, next)).catch(next);
+  };
 }
 
-function readJsonBody(request) {
+function getAll(sql, parameters = []) {
   return new Promise((resolve, reject) => {
-    let body = '';
-    let tooLarge = false;
-
-    request.on('data', (chunk) => {
-      if (tooLarge) {
+    db.all(sql, parameters, (error, rows) => {
+      if (error) {
+        reject(error);
         return;
       }
-
-      body += chunk;
-      if (Buffer.byteLength(body) > 1024 * 1024) {
-        tooLarge = true;
-        const error = new Error('Request body must be no larger than 1 MB');
-        error.statusCode = 413;
-        reject(error);
-      }
+      resolve(rows);
     });
+  });
+}
 
-    request.on('end', () => {
-      if (tooLarge) {
+function getOne(sql, parameters = []) {
+  return new Promise((resolve, reject) => {
+    db.get(sql, parameters, (error, row) => {
+      if (error) {
+        reject(error);
         return;
       }
-
-      try {
-        resolve(JSON.parse(body));
-      } catch {
-        const error = new Error('Request body must be valid JSON');
-        error.statusCode = 400;
-        reject(error);
-      }
+      resolve(row);
     });
+  });
+}
 
-    request.on('error', reject);
+function run(sql, parameters = []) {
+  return new Promise((resolve, reject) => {
+    db.run(sql, parameters, function (error) {
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve({ lastID: this.lastID, changes: this.changes });
+    });
   });
 }
 
@@ -72,160 +74,132 @@ function validateCourse(course) {
   return null;
 }
 
-function getAll(db, sql, parameters = []) {
-  return new Promise((resolve, reject) => {
-    db.all(sql, parameters, (error, rows) => {
-      if (error) {
-        reject(error);
-        return;
-      }
-      resolve(rows);
-    });
-  });
-}
-
-function getOne(db, sql, parameters = []) {
-  return new Promise((resolve, reject) => {
-    db.get(sql, parameters, (error, row) => {
-      if (error) {
-        reject(error);
-        return;
-      }
-      resolve(row);
-    });
-  });
-}
-
-function run(db, sql, parameters = []) {
-  return new Promise((resolve, reject) => {
-    db.run(sql, parameters, function (error) {
-      if (error) {
-        reject(error);
-        return;
-      }
-      resolve({ lastID: this.lastID, changes: this.changes });
-    });
-  });
-}
-
-async function handleRequest(db, request, response) {
-  const url = new URL(request.url, 'http://localhost');
-  const match = url.pathname.match(/^\/api\/courses(?:\/([^/]+))?\/?$/);
-
-  if (!match) {
-    sendJson(response, 404, { error: 'Endpoint not found' });
+function validateCourseId(request, response, next) {
+  if (!/^[1-9]\d*$/.test(request.params.id)) {
+    response.status(400).json({ error: 'Course ID must be a positive integer' });
     return;
   }
 
-  const idSegment = match[1];
-  const id = idSegment === undefined ? null : Number(idSegment);
-  if (idSegment !== undefined && (!Number.isInteger(id) || id <= 0)) {
-    sendJson(response, 400, { error: 'Course ID must be a positive integer' });
+  const id = Number(request.params.id);
+  if (!Number.isSafeInteger(id)) {
+    response.status(400).json({ error: 'Course ID must be a positive integer' });
     return;
   }
 
-  const allowedMethods = idSegment === undefined
-    ? ['GET', 'POST']
-    : ['GET', 'PUT', 'DELETE'];
-  if (!allowedMethods.includes(request.method)) {
-    sendJson(response, 405, { error: 'Method not allowed' }, {
-      Allow: allowedMethods.join(', '),
-    });
-    return;
-  }
+  request.courseId = id;
+  next();
+}
 
-  try {
-    if (request.method === 'GET' && id === null) {
-      const courses = await getAll(db, 'SELECT * FROM courses ORDER BY id');
-      sendJson(response, 200, courses);
+function courseValues(course) {
+  return [
+    course.courseCode.trim(),
+    course.title.trim(),
+    course.credits,
+    course.description,
+    course.semester.trim(),
+  ];
+}
+
+app.get('/api/courses', asyncRoute(async (request, response) => {
+  const courses = await getAll('SELECT * FROM courses ORDER BY id');
+  response.json(courses);
+}));
+
+app.get(
+  '/api/courses/:id',
+  validateCourseId,
+  asyncRoute(async (request, response) => {
+    const course = await getOne(
+      'SELECT * FROM courses WHERE id = ?',
+      [request.courseId]
+    );
+    if (!course) {
+      response.status(404).json({ error: 'Course not found' });
       return;
     }
+    response.json(course);
+  })
+);
 
-    if (request.method === 'GET') {
-      const course = await getOne(db, 'SELECT * FROM courses WHERE id = ?', [id]);
-      if (!course) {
-        sendJson(response, 404, { error: 'Course not found' });
-        return;
-      }
-      sendJson(response, 200, course);
-      return;
-    }
+app.post('/api/courses', asyncRoute(async (request, response) => {
+  const validationError = validateCourse(request.body);
+  if (validationError) {
+    response.status(400).json({ error: validationError });
+    return;
+  }
 
-    const course = await readJsonBody(request);
-    const validationError = validateCourse(course);
+  const result = await run(
+    `INSERT INTO courses (courseCode, title, credits, description, semester)
+     VALUES (?, ?, ?, ?, ?)`,
+    courseValues(request.body)
+  );
+  const course = await getOne('SELECT * FROM courses WHERE id = ?', [result.lastID]);
+  response.status(201).json(course);
+}));
+
+app.put(
+  '/api/courses/:id',
+  validateCourseId,
+  asyncRoute(async (request, response) => {
+    const validationError = validateCourse(request.body);
     if (validationError) {
-      sendJson(response, 400, { error: validationError });
+      response.status(400).json({ error: validationError });
       return;
     }
 
-    const values = [
-      course.courseCode.trim(),
-      course.title.trim(),
-      course.credits,
-      course.description,
-      course.semester.trim(),
-    ];
-
-    if (request.method === 'POST') {
-      const result = await run(
-        db,
-        `INSERT INTO courses (courseCode, title, credits, description, semester)
-         VALUES (?, ?, ?, ?, ?)`,
-        values
-      );
-      const createdCourse = await getOne(
-        db,
-        'SELECT * FROM courses WHERE id = ?',
-        [result.lastID]
-      );
-      sendJson(response, 201, createdCourse);
-      return;
-    }
-
-    if (request.method === 'PUT') {
-      const result = await run(
-        db,
-        `UPDATE courses
-         SET courseCode = ?, title = ?, credits = ?, description = ?, semester = ?
-         WHERE id = ?`,
-        [...values, id]
-      );
-      if (result.changes === 0) {
-        sendJson(response, 404, { error: 'Course not found' });
-        return;
-      }
-
-      const updatedCourse = await getOne(
-        db,
-        'SELECT * FROM courses WHERE id = ?',
-        [id]
-      );
-      sendJson(response, 200, updatedCourse);
-      return;
-    }
-
-    const result = await run(db, 'DELETE FROM courses WHERE id = ?', [id]);
+    const result = await run(
+      `UPDATE courses
+       SET courseCode = ?, title = ?, credits = ?, description = ?, semester = ?
+       WHERE id = ?`,
+      [...courseValues(request.body), request.courseId]
+    );
     if (result.changes === 0) {
-      sendJson(response, 404, { error: 'Course not found' });
+      response.status(404).json({ error: 'Course not found' });
       return;
     }
-    sendJson(response, 200, { message: 'Course deleted successfully' });
-  } catch (error) {
-    console.error('API request failed:', error.message);
-    sendJson(response, error.statusCode || 500, {
-      error: error.statusCode ? error.message : 'Database operation failed',
-    });
-  }
-}
 
-const server = http.createServer((request, response) => {
-  handleRequest(db, request, response).catch((error) => {
-    console.error('Unexpected API error:', error.message);
-    sendJson(response, 500, { error: 'Internal server error' });
+    const course = await getOne(
+      'SELECT * FROM courses WHERE id = ?',
+      [request.courseId]
+    );
+    response.json(course);
+  })
+);
+
+app.delete(
+  '/api/courses/:id',
+  validateCourseId,
+  asyncRoute(async (request, response) => {
+    const result = await run(
+      'DELETE FROM courses WHERE id = ?',
+      [request.courseId]
+    );
+    if (result.changes === 0) {
+      response.status(404).json({ error: 'Course not found' });
+      return;
+    }
+    response.json({ message: 'Course deleted successfully' });
+  })
+);
+
+app.use((request, response) => {
+  response.status(404).json({ error: 'Endpoint not found' });
+});
+
+app.use((error, request, response, next) => {
+  console.error('API request failed:', error.message);
+  if (response.headersSent) {
+    next(error);
+    return;
+  }
+
+  const status = error.status || error.statusCode || 500;
+  response.status(status).json({
+    error: status >= 500 ? 'Database operation failed' : error.message,
   });
 });
 
-const db = new sqlite3.Database(
+db = new sqlite3.Database(
   databasePath,
   sqlite3.OPEN_READWRITE,
   (error) => {
@@ -235,13 +209,17 @@ const db = new sqlite3.Database(
       return;
     }
 
-    server.listen(port, () => {
+    server = app.listen(port, () => {
       console.log(`Course API listening on http://localhost:${port}`);
     });
   }
 );
 
 function closeServer() {
+  if (!server) {
+    return;
+  }
+
   server.close(() => {
     db.close((error) => {
       if (error) {
